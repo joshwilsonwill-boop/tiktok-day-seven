@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lantern Field, day seven</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0c140e; overflow: hidden; }
+  canvas { display: block; width: 1280px; height: 720px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+<script>
+"use strict";
+// Lantern Field, day-seven build.
+// The same tiny game after a week of daily updates: same map, same start,
+// same seeded orb layout and demo route as day one, plus a week of work:
+// thorn wisps to dodge, three lives, combos, gold and star orbs, waves,
+// shield and magnet power-ups, particles, floating score popups, a minimap,
+// a progress bar, day and night tinting, drifting fireflies, pause and
+// restart, and a title screen and a game-over screen.
+// Written from scratch for the make.fun "Day one, day seven" bounty.
+// Zero network at runtime, all art drawn on canvas, system fonts only.
+(function () {
+  var W = 1280, H = 720, STEP = 1 / 60;
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var SEED = 20261123;
+
+  // The map. Identical to day one: same hedges, same start.
+  var HEDGES = [
+    { x: 120, y: 110, w: 200, h: 46 },
+    { x: 960, y: 110, w: 200, h: 46 },
+    { x: 120, y: 560, w: 200, h: 46 },
+    { x: 960, y: 560, w: 200, h: 46 },
+    { x: 590, y: 300, w: 100, h: 40 },
+    { x: 180, y: 320, w: 46, h: 120 },
+    { x: 1054, y: 320, w: 46, h: 120 }
+  ];
+  var START = { x: 640, y: 620 };
+
+  function makeState() {
+    var rng = mulberry32(SEED);
+    var orbs = [];
+    var tries = 0;
+    while (orbs.length < 10 && tries < 400) {
+      tries++;
+      var x = 90 + rng() * (W - 180);
+      var y = 90 + rng() * (H - 220);
+      var ok = true;
+      for (var i = 0; i < HEDGES.length; i++) {
+        var g = HEDGES[i];
+        if (x > g.x - 30 && x < g.x + g.w + 30 && y > g.y - 30 && y < g.y + g.h + 30) { ok = false; break; }
+      }
+      if (ok && Math.hypot(x - START.x, y - START.y) < 120) ok = false;
+      if (ok) {
+        for (var j = 0; j < orbs.length; j++) {
+          if (Math.hypot(x - orbs[j].x, y - orbs[j].y) < 110) { ok = false; break; }
+        }
+      }
+      if (ok) orbs.push({ x: x, y: y, r: 12, kind: "gold", taken: false, respawn: 0 });
+    }
+    // Ambient fireflies, fixed by the same seed.
+    var flies = [];
+    for (var f = 0; f < 24; f++) {
+      flies.push({ x: rng() * W, y: rng() * H, ph: rng() * Math.PI * 2, sp: 0.4 + rng() * 0.8 });
+    }
+    // Thorn wisps, fixed starting spots.
+    var wisps = [
+      { x: 300, y: 200, a: rng() * Math.PI * 2, retarget: 0, speed: 40 },
+      { x: 980, y: 180, a: rng() * Math.PI * 2, retarget: 0, speed: 40 },
+      { x: 640, y: 300, a: rng() * Math.PI * 2, retarget: 0, speed: 40 }
+    ];
+    return {
+      time: 0, score: 0, collected: 0, combo: 0, comboTimer: 0, bestCombo: 0,
+      lives: 4, wave: 1, wave2: false, invuln: 0, shield: false, magnet: 0,
+      screen: "play", paused: false,
+      player: { x: START.x, y: START.y, r: 16, speed: 230 },
+      orbs: orbs, flies: flies, wisps: wisps,
+      route: orbs.map(function (o, i) { return i; }),
+      wp: 0, keys: {},
+      particles: [], popups: [],
+      powerups: [
+        { x: orbs[5].x + 60, y: orbs[5].y, kind: "shield", at: 9, taken: false, active: false },
+        { x: orbs[8].x - 60, y: orbs[8].y, kind: "magnet", at: 15, taken: false, active: false }
+      ]
+    };
+  }
+
+  var S = makeState();
+  var params = new URLSearchParams(location.search);
+  var DEMO = params.get("demo") === "1";
+  var STEPMODE = params.get("stepmode") === "1";
+
+  function circleHitsRect(cx, cy, r, g) {
+    var nx = Math.max(g.x, Math.min(cx, g.x + g.w));
+    var ny = Math.max(g.y, Math.min(cy, g.y + g.h));
+    return Math.hypot(cx - nx, cy - ny) < r;
+  }
+
+  function movePlayer(dx, dy, dt) {
+    var p = S.player;
+    var nx = p.x + dx * dt, ny = p.y + dy * dt;
+    var xBlocked = false, yBlocked = false;
+    for (var i = 0; i < HEDGES.length; i++) {
+      if (circleHitsRect(nx, p.y, p.r, HEDGES[i])) xBlocked = true;
+      if (circleHitsRect(p.x, ny, p.r, HEDGES[i])) yBlocked = true;
+    }
+    if (!xBlocked) p.x = nx;
+    if (!yBlocked) p.y = ny;
+    p.x = Math.max(p.r, Math.min(W - p.r, p.x));
+    p.y = Math.max(p.r, Math.min(H - p.r, p.y));
+  }
+
+  function steer(dt) {
+    var target = S.orbs[S.route[S.wp]];
+    if (!target) return;
+    var dx = target.x - S.player.x, dy = target.y - S.player.y;
+    var d = Math.hypot(dx, dy);
+    if (d < 18) { S.wp = (S.wp + 1) % S.route.length; return; }
+    movePlayer((dx / d) * S.player.speed, (dy / d) * S.player.speed, dt);
+  }
+
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = (i / n) * Math.PI * 2 + S.time;
+      var sp = 60 + (i % 5) * 22;
+      S.particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, life: 0.6, max: 0.6, color: color });
+    }
+  }
+
+  function popup(x, y, text, color) {
+    S.popups.push({ x: x, y: y, text: text, life: 1.0, color: color });
+  }
+
+  function collectOrb(o) {
+    o.taken = true; o.respawn = 0;
+    S.collected += 1;
+    if (S.comboTimer > 0) S.combo += 1; else S.combo = 1;
+    S.comboTimer = 2.5;
+    if (S.combo > S.bestCombo) S.bestCombo = S.combo;
+    var pts = o.kind === "star" ? 5 : 1;
+    var mult = 1 + Math.floor(S.combo / 4);
+    S.score += pts * mult;
+    burst(o.x, o.y, o.kind === "star" ? "#7ec8ff" : "#f5b942", 14);
+    popup(o.x, o.y - 24, "+" + (pts * mult) + (S.combo > 1 ? "  x" + S.combo : ""), o.kind === "star" ? "#7ec8ff" : "#ffe9a8");
+    if (!S.wave2 && S.collected >= 8) startWave2();
+  }
+
+  function startWave2() {
+    S.wave2 = true; S.wave = 2;
+    var rng = mulberry32(SEED + 7);
+    var placed = 0, tries = 0;
+    while (placed < 6 && tries < 300) {
+      tries++;
+      var x = 90 + rng() * (W - 180), y = 90 + rng() * (H - 220);
+      var ok = true;
+      for (var i = 0; i < HEDGES.length; i++) {
+        var g = HEDGES[i];
+        if (x > g.x - 30 && x < g.x + g.w + 30 && y > g.y - 30 && y < g.y + g.h + 30) { ok = false; break; }
+      }
+      if (ok) {
+        for (var j = 0; j < S.orbs.length; j++) {
+          if (Math.hypot(x - S.orbs[j].x, y - S.orbs[j].y) < 110) { ok = false; break; }
+        }
+      }
+      if (ok) { S.orbs.push({ x: x, y: y, r: 12, kind: "star", taken: false, respawn: 0 }); placed++; }
+    }
+    // The demo route grows to cover the new star orbs.
+    var base = S.orbs.length - 6;
+    for (var s = 0; s < 6; s++) S.route.push(base + s);
+    S.wisps.push({ x: 200, y: 480, a: 0, retarget: 0, speed: 45 });
+    S.wisps.push({ x: 1080, y: 480, a: 0, retarget: 0, speed: 45 });
+    popup(S.player.x, S.player.y - 40, "WAVE 2", "#ff8ad8");
+  }
+
+  function update(dt) {
+    if (S.screen !== "play" || S.paused) return;
+    S.time += dt;
+    if (S.comboTimer > 0) { S.comboTimer -= dt; if (S.comboTimer <= 0) S.combo = 0; }
+    if (S.invuln > 0) S.invuln -= dt;
+    if (S.magnet > 0) S.magnet -= dt;
+
+    var k = S.keys;
+    var mx = 0, my = 0;
+    if (k["ArrowLeft"] || k["a"] || k["A"]) mx -= 1;
+    if (k["ArrowRight"] || k["d"] || k["D"]) mx += 1;
+    if (k["ArrowUp"] || k["w"] || k["W"]) my -= 1;
+    if (k["ArrowDown"] || k["s"] || k["S"]) my += 1;
+    if (mx !== 0 || my !== 0) {
+      var len = Math.hypot(mx, my);
+      movePlayer((mx / len) * S.player.speed, (my / len) * S.player.speed, dt);
+    } else if (DEMO) {
+      steer(dt);
+    }
+
+    // Magnet pulls nearby orbs in.
+    if (S.magnet > 0) {
+      for (var m = 0; m < S.orbs.length; m++) {
+        var mo = S.orbs[m];
+        if (mo.taken) continue;
+        var md = Math.hypot(mo.x - S.player.x, mo.y - S.player.y);
+        if (md < 180 && md > 4) {
+          mo.x += ((S.player.x - mo.x) / md) * 300 * dt;
+          mo.y += ((S.player.y - mo.y) / md) * 300 * dt;
+        }
+      }
+    }
+
+    for (var i = 0; i < S.orbs.length; i++) {
+      var o = S.orbs[i];
+      if (o.taken) continue;
+      if (Math.hypot(o.x - S.player.x, o.y - S.player.y) < o.r + S.player.r + 4) collectOrb(o);
+    }
+
+    // Power-ups appear on schedule, on the demo route.
+    for (var q = 0; q < S.powerups.length; q++) {
+      var pu = S.powerups[q];
+      if (!pu.active && !pu.taken && S.time >= pu.at) pu.active = true;
+      if (pu.active && !pu.taken && Math.hypot(pu.x - S.player.x, pu.y - S.player.y) < 30 + S.player.r) {
+        pu.taken = true;
+        if (pu.kind === "shield") { S.shield = true; popup(S.player.x, S.player.y - 40, "SHIELD", "#8affc1"); }
+        else { S.magnet = 6; popup(S.player.x, S.player.y - 40, "MAGNET 6s", "#c9a7ff"); }
+        burst(pu.x, pu.y, "#ffffff", 10);
+      }
+    }
+
+    // Wisps drift, and chase when the player is close.
+    var rngWalk = mulberry32(SEED + Math.floor(S.time * 10) + 99);
+    for (var w = 0; w < S.wisps.length; w++) {
+      var ws = S.wisps[w];
+      var dx = S.player.x - ws.x, dy = S.player.y - ws.y;
+      var dist = Math.hypot(dx, dy);
+      var heading;
+      if (dist < 100) heading = Math.atan2(dy, dx);
+      else {
+        ws.retarget -= dt;
+        if (ws.retarget <= 0) { ws.a = rngWalk() * Math.PI * 2; ws.retarget = 0.8; }
+        heading = ws.a;
+      }
+      var sp = dist < 100 ? ws.speed + 10 : ws.speed;
+      ws.x += Math.cos(heading) * sp * dt;
+      ws.y += Math.sin(heading) * sp * dt;
+      ws.x = Math.max(20, Math.min(W - 20, ws.x));
+      ws.y = Math.max(20, Math.min(H - 20, ws.y));
+      if (dist < 22 && S.invuln <= 0) {
+        if (S.shield) {
+          S.shield = false; S.invuln = 3;
+          burst(S.player.x, S.player.y, "#8affc1", 16);
+          popup(S.player.x, S.player.y - 40, "SHIELD SAVED YOU", "#8affc1");
+        } else {
+          S.lives -= 1; S.invuln = 3; S.combo = 0;
+          burst(S.player.x, S.player.y, "#c65bff", 18);
+          popup(S.player.x, S.player.y - 40, "OUCH", "#ff8ad8");
+          if (S.lives <= 0) { S.screen = "over"; }
+        }
+      }
+    }
+
+    for (var p = S.particles.length - 1; p >= 0; p--) {
+      var pt = S.particles[p];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt;
+      if (pt.life <= 0) S.particles.splice(p, 1);
+    }
+    for (var u = S.popups.length - 1; u >= 0; u--) {
+      var pp = S.popups[u];
+      pp.y -= 34 * dt; pp.life -= dt;
+      if (pp.life <= 0) S.popups.splice(u, 1);
+    }
+  }
+
+  function heart(x, y, s, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(x - s * 0.45, y - s * 0.2, s * 0.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x + s * 0.45, y - s * 0.2, s * 0.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x - s * 0.95, y); ctx.lineTo(x + s * 0.95, y);
+    ctx.lineTo(x, y + s); ctx.closePath(); ctx.fill();
+  }
+
+  function draw() {
+    // Ground with a slow day and night tint.
+    var night = 0.5 + 0.5 * Math.sin((S.time / 30) * Math.PI * 2);
+    ctx.fillStyle = "#16281c";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#1d3324";
+    for (var gy = 40; gy < H; gy += 80) {
+      for (var gx = 40; gx < W; gx += 80) { ctx.fillRect(gx, gy, 3, 3); }
+    }
+    // Fireflies.
+    for (var f = 0; f < S.flies.length; f++) {
+      var fl = S.flies[f];
+      var fx = fl.x + Math.sin(S.time * fl.sp + fl.ph) * 14;
+      var fy = fl.y + Math.cos(S.time * fl.sp * 0.8 + fl.ph) * 10;
+      ctx.fillStyle = "rgba(255, 233, 168, " + (0.25 + 0.35 * Math.abs(Math.sin(S.time + fl.ph))) + ")";
+      ctx.beginPath(); ctx.arc(fx, fy, 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+    // Hedges, with leaf dots.
+    for (var i = 0; i < HEDGES.length; i++) {
+      var g = HEDGES[i];
+      ctx.fillStyle = "#2c4a2e";
+      ctx.fillRect(g.x, g.y, g.w, g.h);
+      ctx.fillStyle = "#3a5c39";
+      ctx.fillRect(g.x, g.y, g.w, 8);
+      ctx.fillStyle = "#4c7048";
+      for (var lx = g.x + 12; lx < g.x + g.w - 6; lx += 26) { ctx.beginPath(); ctx.arc(lx, g.y + g.h - 12, 4, 0, Math.PI * 2); ctx.fill(); }
+    }
+    // Orbs.
+    for (var j = 0; j < S.orbs.length; j++) {
+      var o = S.orbs[j];
+      if (o.taken) continue;
+      var pulse = 1 + 0.15 * Math.sin(S.time * 3 + j);
+      if (o.kind === "star") {
+        ctx.fillStyle = "#7ec8ff";
+        ctx.beginPath(); ctx.arc(o.x, o.y, o.r * pulse, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#dff1ff";
+        ctx.beginPath(); ctx.arc(o.x, o.y, o.r * 0.45 * pulse, 0, Math.PI * 2); ctx.fill();
+      } else {
+        ctx.fillStyle = "rgba(245, 185, 66, 0.3)";
+        ctx.beginPath(); ctx.arc(o.x, o.y, o.r * 1.8 * pulse, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#f5b942";
+        ctx.beginPath(); ctx.arc(o.x, o.y, o.r * pulse, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#ffe9a8";
+        ctx.beginPath(); ctx.arc(o.x, o.y, o.r * 0.45 * pulse, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    // Power-ups.
+    for (var q = 0; q < S.powerups.length; q++) {
+      var pu = S.powerups[q];
+      if (!pu.active || pu.taken) continue;
+      var bob = Math.sin(S.time * 4) * 4;
+      ctx.fillStyle = pu.kind === "shield" ? "#8affc1" : "#c9a7ff";
+      ctx.beginPath(); ctx.arc(pu.x, pu.y + bob, 16, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#16281c";
+      ctx.font = "bold 18px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(pu.kind === "shield" ? "S" : "M", pu.x, pu.y + bob + 1);
+    }
+    // Wisps.
+    for (var w = 0; w < S.wisps.length; w++) {
+      var ws = S.wisps[w];
+      var wob = Math.sin(S.time * 5 + w * 2) * 3;
+      ctx.fillStyle = "rgba(140, 60, 200, 0.35)";
+      ctx.beginPath(); ctx.arc(ws.x, ws.y + wob, 26, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#8a3cc8";
+      ctx.beginPath(); ctx.arc(ws.x, ws.y + wob, 18, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(ws.x - 6, ws.y + wob - 4, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(ws.x + 6, ws.y + wob - 4, 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#1c0b2e";
+      ctx.beginPath(); ctx.arc(ws.x - 6, ws.y + wob - 4, 1.5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(ws.x + 6, ws.y + wob - 4, 1.5, 0, Math.PI * 2); ctx.fill();
+    }
+    // Player.
+    var p = S.player;
+    if (!(S.invuln > 0 && Math.floor(S.time * 10) % 2 === 0)) {
+      ctx.fillStyle = "rgba(245, 185, 66, 0.30)";
+      ctx.beginPath(); ctx.arc(p.x, p.y, 38, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#f5d76e";
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#7a5a1e";
+      ctx.beginPath(); ctx.arc(p.x - 5, p.y - 3, 2.5, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x + 5, p.y - 3, 2.5, 0, Math.PI * 2); ctx.fill();
+      if (S.shield) {
+        ctx.strokeStyle = "#8affc1"; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 26, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+    // Particles.
+    for (var pt = 0; pt < S.particles.length; pt++) {
+      var pc = S.particles[pt];
+      ctx.globalAlpha = Math.max(0, pc.life / pc.max);
+      ctx.fillStyle = pc.color;
+      ctx.beginPath(); ctx.arc(pc.x, pc.y, 3.5, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Popups.
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (var u = 0; u < S.popups.length; u++) {
+      var pp = S.popups[u];
+      ctx.globalAlpha = Math.max(0, pp.life);
+      ctx.fillStyle = pp.color;
+      ctx.font = "bold 22px sans-serif";
+      ctx.fillText(pp.text, pp.x, pp.y);
+    }
+    ctx.globalAlpha = 1;
+    // Night tint.
+    ctx.fillStyle = "rgba(24, 32, 90, " + (night * 0.12).toFixed(3) + ")";
+    ctx.fillRect(0, 0, W, H);
+    // Vignette.
+    var vg = ctx.createRadialGradient(640, 360, 320, 640, 360, 760);
+    vg.addColorStop(0, "rgba(0,0,0,0)");
+    vg.addColorStop(1, "rgba(0,0,0,0.35)");
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, 0, W, H);
+
+    drawHUD();
+    if (S.screen === "title") drawTitle();
+    if (S.screen === "over") drawOver();
+    if (S.paused) {
+      ctx.fillStyle = "rgba(0,0,0,0.5)";
+      ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 44px sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText("PAUSED", 640, 360);
+    }
+  }
+
+  function drawHUD() {
+    // Top bar.
+    ctx.fillStyle = "rgba(10, 18, 12, 0.72)";
+    ctx.fillRect(0, 0, W, 64);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 28px sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText("SCORE " + S.score, 24, 32);
+    ctx.font = "20px sans-serif";
+    ctx.fillStyle = "#9fb8a4";
+    ctx.fillText("DAY SEVEN", 200, 33);
+    if (S.combo > 1) {
+      ctx.fillStyle = "#ffb347";
+      ctx.font = "bold 26px sans-serif";
+      ctx.fillText("COMBO x" + S.combo, 340, 32);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 22px sans-serif";
+    ctx.fillText("WAVE " + S.wave, 560, 32);
+    // Lives as hearts.
+    for (var li = 0; li < 4; li++) {
+      heart(1046 + li * 34, 32, 11, li < S.lives ? "#ff5d8f" : "#3a3a3a");
+    }
+    // Minimap.
+    var mx = 1088, my = 76, mw = 168, mh = 94;
+    ctx.fillStyle = "rgba(10, 18, 12, 0.72)";
+    ctx.fillRect(mx - 6, my - 6, mw + 12, mh + 12);
+    ctx.fillStyle = "#1d3324";
+    ctx.fillRect(mx, my, mw, mh);
+    var sx = mw / W, sy = mh / H;
+    ctx.fillStyle = "#3a5c39";
+    for (var i = 0; i < HEDGES.length; i++) {
+      var g = HEDGES[i];
+      ctx.fillRect(mx + g.x * sx, my + g.y * sy, Math.max(2, g.w * sx), Math.max(2, g.h * sy));
+    }
+    for (var j = 0; j < S.orbs.length; j++) {
+      var o = S.orbs[j];
+      if (o.taken) continue;
+      ctx.fillStyle = o.kind === "star" ? "#7ec8ff" : "#f5b942";
+      ctx.beginPath(); ctx.arc(mx + o.x * sx, my + o.y * sy, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    for (var w = 0; w < S.wisps.length; w++) {
+      ctx.fillStyle = "#c65bff";
+      ctx.beginPath(); ctx.arc(mx + S.wisps[w].x * sx, my + S.wisps[w].y * sy, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(mx + S.player.x * sx, my + S.player.y * sy, 4, 0, Math.PI * 2); ctx.fill();
+    // Progress bar, bottom center.
+    var goal = S.wave2 ? 14 : 8;
+    var bw = 320, bx = (W - bw) / 2, by = H - 34;
+    ctx.fillStyle = "rgba(10, 18, 12, 0.72)";
+    ctx.fillRect(bx - 10, by - 8, bw + 20, 26);
+    ctx.fillStyle = "#2c4a2e";
+    ctx.fillRect(bx, by, bw, 10);
+    ctx.fillStyle = "#f5b942";
+    ctx.fillRect(bx, by, bw * Math.min(1, S.collected / goal), 10);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "16px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(S.collected + " / " + goal + " orbs to wave " + (S.wave2 ? "3" : "2"), 640, by + 5);
+    // Active power-ups, bottom left.
+    var py = H - 30;
+    ctx.textAlign = "left";
+    if (S.shield) { ctx.fillStyle = "#8affc1"; ctx.font = "bold 18px sans-serif"; ctx.fillText("SHIELD", 24, py); }
+    if (S.magnet > 0) { ctx.fillStyle = "#c9a7ff"; ctx.font = "bold 18px sans-serif"; ctx.fillText("MAGNET " + Math.ceil(S.magnet) + "s", S.shield ? 110 : 24, py); }
+  }
+
+  function drawTitle() {
+    ctx.fillStyle = "rgba(8, 14, 10, 0.78)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "#f5d76e";
+    ctx.font = "bold 84px sans-serif";
+    ctx.fillText("LANTERN FIELD", 640, 260);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "28px sans-serif";
+    ctx.fillText("a tiny game, one week of daily updates", 640, 340);
+    ctx.fillStyle = "#9fb8a4";
+    ctx.font = "22px sans-serif";
+    ctx.fillText("Move with WASD or arrows. Collect the glow. Dodge the wisps.", 640, 400);
+    ctx.fillStyle = "#f5b942";
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillText("Press Enter or click to play", 640, 470);
+  }
+
+  function drawOver() {
+    ctx.fillStyle = "rgba(8, 14, 10, 0.78)";
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "#ff8ad8";
+    ctx.font = "bold 72px sans-serif";
+    ctx.fillText("THE LIGHT WENT OUT", 640, 300);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "28px sans-serif";
+    ctx.fillText("Score " + S.score + "  |  Best combo x" + S.bestCombo + "  |  Wave " + S.wave, 640, 380);
+    ctx.fillStyle = "#f5b942";
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillText("Press R to play again", 640, 450);
+  }
+
+  function step(n) {
+    for (var i = 0; i < n; i++) update(STEP);
+    draw();
+    return snapshot();
+  }
+
+  function snapshot() {
+    return {
+      time: +S.time.toFixed(3), score: S.score, collected: S.collected,
+      combo: S.combo, lives: S.lives, wave: S.wave, screen: S.screen,
+      player: { x: Math.round(S.player.x), y: Math.round(S.player.y) },
+      orbsLeft: S.orbs.filter(function (o) { return !o.taken; }).length,
+      wisps: S.wisps.length
+    };
+  }
+
+  window.__game = {
+    step: step,
+    state: snapshot,
+    reset: function () { S = makeState(); S.screen = "play"; draw(); return snapshot(); }
+  };
+
+  window.addEventListener("keydown", function (e) {
+    S.keys[e.key] = true;
+    if (e.key === "Enter" && S.screen === "title") S.screen = "play";
+    if ((e.key === "r" || e.key === "R") && S.screen === "over") { S = makeState(); S.screen = "play"; }
+    if ((e.key === "p" || e.key === "P") && S.screen === "play") S.paused = !S.paused;
+    if ((e.key === "r" || e.key === "R") && S.screen === "play") { S = makeState(); S.screen = "play"; }
+  });
+  window.addEventListener("keyup", function (e) { S.keys[e.key] = false; });
+  canvas.addEventListener("click", function () { if (S.screen === "title") S.screen = "play"; });
+
+  var shot = params.get("shot");
+  if (shot === "title") {
+    S.screen = "title";
+    draw();
+    window.__shotReady = true;
+  } else if (shot === "over") {
+    S.lives = 0; S.screen = "over";
+    draw();
+    window.__shotReady = true;
+  } else if (shot === "play") {
+    var t = parseFloat(params.get("t") || "6");
+    S.screen = "play";
+    step(Math.round(t * 60));
+    window.__shotReady = true;
+  } else {
+    if (!DEMO && !STEPMODE) S.screen = "title";
+    draw();
+    window.__shotReady = true;
+  }
+
+  if (DEMO && !STEPMODE) {
+    var last = performance.now();
+    (function loop(now) {
+      var dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      var acc = dt;
+      while (acc >= STEP) { update(STEP); acc -= STEP; }
+      draw();
+      requestAnimationFrame(loop);
+    })(last);
+  }
+})();
+</script>
+</body>
+</html>

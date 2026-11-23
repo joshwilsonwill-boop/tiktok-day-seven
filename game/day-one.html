@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Lantern Field, day one</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0c140e; overflow: hidden; }
+  canvas { display: block; width: 1280px; height: 720px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1280" height="720"></canvas>
+<script>
+"use strict";
+// Lantern Field, day one build.
+// A tiny top-down collector, written from scratch for the make.fun
+// "Day one, day seven" bounty. Day one is the bare minimum: move, collect
+// glow orbs, keep score. Same map and same start as the day-seven build.
+// Zero network at runtime, all art drawn on canvas, system fonts only.
+(function () {
+  var W = 1280, H = 720, STEP = 1 / 60;
+  var canvas = document.getElementById("game");
+  var ctx = canvas.getContext("2d");
+
+  // Fixed seed, so the demo plays out identically every run.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      var t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  var SEED = 20261123;
+
+  // The map. Hedge blocks the player cannot pass through.
+  var HEDGES = [
+    { x: 120, y: 110, w: 200, h: 46 },
+    { x: 960, y: 110, w: 200, h: 46 },
+    { x: 120, y: 560, w: 200, h: 46 },
+    { x: 960, y: 560, w: 200, h: 46 },
+    { x: 590, y: 300, w: 100, h: 40 },
+    { x: 180, y: 320, w: 46, h: 120 },
+    { x: 1054, y: 320, w: 46, h: 120 }
+  ];
+  var START = { x: 640, y: 620 };
+
+  function makeState() {
+    var rng = mulberry32(SEED);
+    var orbs = [];
+    var tries = 0;
+    while (orbs.length < 10 && tries < 400) {
+      tries++;
+      var x = 90 + rng() * (W - 180);
+      var y = 90 + rng() * (H - 220);
+      var ok = true;
+      for (var i = 0; i < HEDGES.length; i++) {
+        var g = HEDGES[i];
+        if (x > g.x - 30 && x < g.x + g.w + 30 && y > g.y - 30 && y < g.y + g.h + 30) { ok = false; break; }
+      }
+      if (ok && Math.hypot(x - START.x, y - START.y) < 120) ok = false;
+      if (ok) {
+        for (var j = 0; j < orbs.length; j++) {
+          if (Math.hypot(x - orbs[j].x, y - orbs[j].y) < 110) { ok = false; break; }
+        }
+      }
+      if (ok) orbs.push({ x: x, y: y, r: 12, taken: false, respawn: 0 });
+    }
+    return {
+      time: 0, score: 0, collected: 0,
+      player: { x: START.x, y: START.y, r: 16, speed: 230 },
+      orbs: orbs,
+      route: orbs.map(function (o, i) { return i; }),
+      wp: 0,
+      keys: {}
+    };
+  }
+
+  var S = makeState();
+  var params = new URLSearchParams(location.search);
+  var DEMO = params.get("demo") === "1";
+  var STEPMODE = params.get("stepmode") === "1";
+
+  function circleHitsRect(cx, cy, r, g) {
+    var nx = Math.max(g.x, Math.min(cx, g.x + g.w));
+    var ny = Math.max(g.y, Math.min(cy, g.y + g.h));
+    return Math.hypot(cx - nx, cy - ny) < r;
+  }
+
+  function movePlayer(dx, dy, dt) {
+    var p = S.player;
+    var nx = p.x + dx * dt, ny = p.y + dy * dt;
+    var xBlocked = false, yBlocked = false;
+    for (var i = 0; i < HEDGES.length; i++) {
+      if (circleHitsRect(nx, p.y, p.r, HEDGES[i])) xBlocked = true;
+      if (circleHitsRect(p.x, ny, p.r, HEDGES[i])) yBlocked = true;
+    }
+    if (!xBlocked) p.x = nx;
+    if (!yBlocked) p.y = ny;
+    p.x = Math.max(p.r, Math.min(W - p.r, p.x));
+    p.y = Math.max(p.r, Math.min(H - p.r, p.y));
+  }
+
+  function steer(dt) {
+    // Demo steering: walk the orb route in order, so the same opening
+    // plays out in both builds.
+    var target = S.orbs[S.route[S.wp]];
+    if (!target) return;
+    var dx = target.x - S.player.x, dy = target.y - S.player.y;
+    var d = Math.hypot(dx, dy);
+    if (d < 18) { S.wp = (S.wp + 1) % S.route.length; return; }
+    movePlayer((dx / d) * S.player.speed, (dy / d) * S.player.speed, dt);
+  }
+
+  function update(dt) {
+    S.time += dt;
+    var k = S.keys;
+    var mx = 0, my = 0;
+    if (k["ArrowLeft"] || k["a"] || k["A"]) mx -= 1;
+    if (k["ArrowRight"] || k["d"] || k["D"]) mx += 1;
+    if (k["ArrowUp"] || k["w"] || k["W"]) my -= 1;
+    if (k["ArrowDown"] || k["s"] || k["S"]) my += 1;
+    if (mx !== 0 || my !== 0) {
+      var len = Math.hypot(mx, my);
+      movePlayer((mx / len) * S.player.speed, (my / len) * S.player.speed, dt);
+    } else if (DEMO) {
+      steer(dt);
+    }
+    for (var i = 0; i < S.orbs.length; i++) {
+      var o = S.orbs[i];
+      if (o.taken) {
+        o.respawn -= dt;
+        if (o.respawn <= 0) o.taken = false;
+        continue;
+      }
+      if (Math.hypot(o.x - S.player.x, o.y - S.player.y) < o.r + S.player.r + 4) {
+        o.taken = true; o.respawn = 4;
+        S.score += 1; S.collected += 1;
+      }
+    }
+  }
+
+  function draw() {
+    ctx.fillStyle = "#16281c";
+    ctx.fillRect(0, 0, W, H);
+    // Faint ground dots for texture.
+    ctx.fillStyle = "#1d3324";
+    for (var gy = 40; gy < H; gy += 80) {
+      for (var gx = 40; gx < W; gx += 80) {
+        ctx.fillRect(gx, gy, 3, 3);
+      }
+    }
+    // Hedges.
+    for (var i = 0; i < HEDGES.length; i++) {
+      var g = HEDGES[i];
+      ctx.fillStyle = "#2c4a2e";
+      ctx.fillRect(g.x, g.y, g.w, g.h);
+      ctx.fillStyle = "#3a5c39";
+      ctx.fillRect(g.x, g.y, g.w, 8);
+    }
+    // Orbs.
+    for (var j = 0; j < S.orbs.length; j++) {
+      var o = S.orbs[j];
+      if (o.taken) continue;
+      var pulse = 1 + 0.15 * Math.sin(S.time * 3 + j);
+      ctx.fillStyle = "#f5b942";
+      ctx.beginPath(); ctx.arc(o.x, o.y, o.r * pulse, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#ffe9a8";
+      ctx.beginPath(); ctx.arc(o.x, o.y, o.r * 0.45 * pulse, 0, Math.PI * 2); ctx.fill();
+    }
+    // Player: a little lantern keeper.
+    var p = S.player;
+    ctx.fillStyle = "rgba(245, 185, 66, 0.25)";
+    ctx.beginPath(); ctx.arc(p.x, p.y, 34, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#f5d76e";
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#7a5a1e";
+    ctx.beginPath(); ctx.arc(p.x - 5, p.y - 3, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x + 5, p.y - 3, 2.5, 0, Math.PI * 2); ctx.fill();
+    // Plain day-one HUD: score only.
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 28px sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "top";
+    ctx.fillText("ORBS " + S.score, 24, 20);
+    ctx.font = "20px sans-serif";
+    ctx.fillStyle = "#9fb8a4";
+    ctx.fillText("DAY ONE", 24, 56);
+  }
+
+  function step(n) {
+    for (var i = 0; i < n; i++) update(STEP);
+    draw();
+    return snapshot();
+  }
+
+  function snapshot() {
+    return {
+      time: +S.time.toFixed(3), score: S.score, collected: S.collected,
+      player: { x: Math.round(S.player.x), y: Math.round(S.player.y) },
+      orbsLeft: S.orbs.filter(function (o) { return !o.taken; }).length
+    };
+  }
+
+  window.__game = {
+    step: step,
+    state: snapshot,
+    reset: function () { S = makeState(); draw(); return snapshot(); }
+  };
+
+  window.addEventListener("keydown", function (e) { S.keys[e.key] = true; });
+  window.addEventListener("keyup", function (e) { S.keys[e.key] = false; });
+
+  // Staged screenshot support: ?shot=play&t=6 runs the demo synchronously
+  // to that many seconds, paints once, and flags readiness.
+  var shot = params.get("shot");
+  if (shot === "play") {
+    var t = parseFloat(params.get("t") || "6");
+    step(Math.round(t * 60));
+    window.__shotReady = true;
+  } else {
+    draw();
+    window.__shotReady = true;
+  }
+
+  if (DEMO && !STEPMODE) {
+    var last = performance.now();
+    (function loop(now) {
+      var dt = Math.min(0.05, (now - last) / 1000);
+      last = now;
+      var acc = dt;
+      while (acc >= STEP) { update(STEP); acc -= STEP; }
+      draw();
+      requestAnimationFrame(loop);
+    })(last);
+  }
+})();
+</script>
+</body>
+</html>
